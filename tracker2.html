@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MediaPipe Web Tracker</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; background-color: #1e1e1e; color: white; padding: 20px; }
+        canvas { border: 2px solid #00ffcc; max-width: 100%; margin-top: 20px; border-radius: 8px; }
+        video { display: none; } /* Hide the raw video, only show the drawn canvas */
+        .btn { padding: 10px 20px; font-size: 16px; cursor: pointer; background: #00ffcc; color: black; border: none; border-radius: 5px; font-weight: bold; text-decoration: none; margin: 5px; }
+        .btn:disabled { background: #555; color: #888; cursor: not-allowed; }
+        #downloadBtn { background: #ffaa00; display: none; } /* Hidden until processing finishes */
+    </style>
+</head>
+<body>
+    <h2>JavaScript MediaPipe Pose Tracker</h2>
+    <p id="status" style="color: #ffaa00;">Loading AI Model... Please wait.</p>
+    
+    <div>
+        <!-- Upload Button -->
+        <input type="file" id="videoUpload" class="btn" accept="video/mp4,video/x-m4v,video/*" disabled>
+        <!-- Download Button -->
+        <a id="downloadBtn" class="btn" download="tracked_lifting_output.webm">Download Video</a>
+    </div>
+    
+    <!-- Hidden video player -->
+    <video id="video" muted playsinline></video>
+    
+    <!-- Canvas where the stick figure is drawn -->
+    <canvas id="outputCanvas"></canvas>
+
+    <!-- Import modern MediaPipe Tasks Vision API (using the .mjs fix) -->
+    <script type="module">
+        import { PoseLandmarker, FilesetResolver, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/vision_bundle.mjs";
+
+        const video = document.getElementById("video");
+        const canvas = document.getElementById("outputCanvas");
+        const ctx = canvas.getContext("2d");
+        const status = document.getElementById("status");
+        const videoUpload = document.getElementById("videoUpload");
+        const downloadBtn = document.getElementById("downloadBtn");
+
+        let poseLandmarker = null;
+        let drawingUtils = new DrawingUtils(ctx);
+        let isProcessing = false;
+        let lastVideoTime = -1;
+
+        // Recording variables
+        let mediaRecorder;
+        let recordedChunks = [];
+
+        // 1. Download and Initialize the Model
+        async function loadModel() {
+            const vision = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+            );
+            poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numPoses: 1
+            });
+            status.innerText = "Model Loaded! Upload your .mp4 video.";
+            status.style.color = "#00ffcc";
+            videoUpload.disabled = false;
+        }
+        loadModel();
+
+        // 2. Handle the User's Video Upload
+        videoUpload.addEventListener("change", (event) => {
+            const file = event.target.files[0];
+            if (!file) return;
+            
+            // Hide download button if uploading a new video
+            downloadBtn.style.display = "none";
+            recordedChunks = [];
+            
+            const fileURL = URL.createObjectURL(file);
+            video.src = fileURL;
+            status.innerText = `Processing '${file.name}'... Please let the video play to the end.`;
+            status.style.color = "white";
+        });
+
+        // 3. Start processing and recording once the video loads
+        video.addEventListener("loadeddata", () => {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            video.play();
+            isProcessing = true;
+
+            // Setup the Canvas Recorder (capturing at 30 frames per second)
+            const stream = canvas.captureStream(30);
+            mediaRecorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
+            
+            mediaRecorder.ondataavailable = (e) => {
+                if (e.data.size > 0) recordedChunks.push(e.data);
+            };
+            
+            mediaRecorder.onstop = () => {
+                // Combine the recorded chunks into a playable video file
+                const blob = new Blob(recordedChunks, { type: 'video/webm' });
+                const url = URL.createObjectURL(blob);
+                
+                // Attach the file to the download button and reveal it
+                downloadBtn.href = url;
+                downloadBtn.style.display = "inline-block";
+                status.innerText = "Processing Complete! Click the orange button to save your file.";
+                status.style.color = "#00ffcc";
+            };
+
+            mediaRecorder.start();
+            predictFrame();
+        });
+
+        // 4. Frame-by-Frame Tracking Loop
+        async function predictFrame() {
+            if (!isProcessing) return;
+
+            if (video.currentTime !== lastVideoTime) {
+                lastVideoTime = video.currentTime;
+                
+                const results = await poseLandmarker.detectForVideo(video, performance.now());
+                
+                // Draw the video frame
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                
+                // Draw the stick figure
+                if (results.landmarks) {
+                    for (const landmark of results.landmarks) {
+                        drawingUtils.drawConnectors(landmark, PoseLandmarker.POSE_CONNECTIONS, { color: "#FFFFFF", lineWidth: 4 });
+                        drawingUtils.drawLandmarks(landmark, { color: "#FF0000", lineWidth: 2, radius: 4 });
+                    }
+                }
+            }
+
+            if (!video.ended) {
+                requestAnimationFrame(predictFrame);
+            } else {
+                // Stop the recording when the video finishes
+                mediaRecorder.stop();
+                isProcessing = false;
+            }
+        }
+    </script>
+</body>
+</html>

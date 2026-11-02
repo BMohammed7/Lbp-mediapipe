@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MediaPipe Web Tracker & CSV Exporter</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; background-color: #1e1e1e; color: white; padding: 20px; }
+        .container { display: flex; justify-content: space-around; flex-wrap: wrap; margin-top: 20px; }
+        .module { background: #2a2a2a; padding: 20px; border-radius: 10px; width: 45%; min-width: 400px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); margin-bottom: 20px; }
+        canvas { border: 2px solid #555; max-width: 100%; margin-top: 15px; border-radius: 8px; background: #000; }
+        video, img { display: none; }
+        .btn { padding: 10px 15px; font-size: 14px; cursor: pointer; color: black; border: none; border-radius: 5px; font-weight: bold; text-decoration: none; margin: 5px; display: inline-block;}
+        .btn:disabled { background: #555; color: #888; cursor: not-allowed; }
+        .btn-upload { background: #00ffcc; }
+        .btn-csv { background: #ff3366; color: white; display: none; }
+        .btn-vid { background: #ffaa00; display: none; }
+        h3 { color: #00ffcc; }
+    </style>
+</head>
+<body>
+    <h2>Lower Back Pain Prediction: MediaPipe Pipeline</h2>
+    <p id="status" style="color: #ffaa00; font-weight: bold;">Loading AI Models (Image & Video)... Please wait.</p>
+    
+    <div class="container">
+        <!-- STEP 1: STATIC CALIBRATION -->
+        <div class="module" id="calibrationModule">
+            <h3>Step 1: Static Calibration (Image)</h3>
+            <p style="font-size: 13px; color: #aaa;">Upload a straight-on, full-body photo to lock in fixed bone lengths.</p>
+            <input type="file" id="imageUpload" class="btn btn-upload" accept="image/png, image/jpeg" disabled>
+            <a id="downloadImageCsvBtn" class="btn btn-csv" download="calibration_pose.csv">Download Calibration CSV</a>
+            <br>
+            <img id="staticImage" alt="calibration">
+            <canvas id="imageCanvas"></canvas>
+        </div>
+
+        <!-- STEP 2: DYNAMIC KINEMATICS -->
+        <div class="module" id="kinematicsModule">
+            <h3>Step 2: Kinematic Tracking (Video)</h3>
+            <p style="font-size: 13px; color: #aaa;">Upload the lifting video to map dynamic joint angles over time.</p>
+            <input type="file" id="videoUpload" class="btn btn-upload" accept="video/mp4,video/x-m4v,video/*" disabled>
+            <a id="downloadVideoBtn" class="btn btn-vid" download="tracked_lift.webm">Download Video</a>
+            <a id="downloadVideoCsvBtn" class="btn btn-csv" download="kinematic_coordinates.csv">Download Kinematic CSV</a>
+            <br>
+            <video id="video" muted playsinline></video>
+            <canvas id="videoCanvas"></canvas>
+        </div>
+    </div>
+
+    <script type="module">
+        import { PoseLandmarker, FilesetResolver, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/vision_bundle.mjs";
+
+        // Global State
+        let imageLandmarker = null;
+        let videoLandmarker = null;
+        const status = document.getElementById("status");
+
+        // Image Elements
+        const imageUpload = document.getElementById("imageUpload");
+        const staticImage = document.getElementById("staticImage");
+        const imageCanvas = document.getElementById("imageCanvas");
+        const imageCtx = imageCanvas.getContext("2d");
+        const downloadImageCsvBtn = document.getElementById("downloadImageCsvBtn");
+        const imageDrawingUtils = new DrawingUtils(imageCtx);
+
+        // Video Elements
+        const videoUpload = document.getElementById("videoUpload");
+        const video = document.getElementById("video");
+        const videoCanvas = document.getElementById("videoCanvas");
+        const videoCtx = videoCanvas.getContext("2d");
+        const downloadVideoBtn = document.getElementById("downloadVideoBtn");
+        const downloadVideoCsvBtn = document.getElementById("downloadVideoCsvBtn");
+        const videoDrawingUtils = new DrawingUtils(videoCtx);
+
+        // Video Processing State
+        let isProcessingVideo = false;
+        let lastVideoTime = -1;
+        let mediaRecorder;
+        let recordedChunks = [];
+        let videoCsvData = [];
+        let frameCount = 0;
+
+        // 1. Initialize Both Models
+        async function loadModels() {
+            const vision = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+            );
+            const modelAssetPath = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+            
+            // Build the image-specific engine
+            imageLandmarker = await PoseLandmarker.createFromOptions(vision, {
+                baseOptions: { modelAssetPath: modelAssetPath, delegate: "GPU" },
+                runningMode: "IMAGE", numPoses: 1
+            });
+
+            // Build the video-specific engine
+            videoLandmarker = await PoseLandmarker.createFromOptions(vision, {
+                baseOptions: { modelAssetPath: modelAssetPath, delegate: "GPU" },
+                runningMode: "VIDEO", numPoses: 1
+            });
+
+            status.innerText = "Systems Online! Awaiting calibration image and lifting video.";
+            status.style.color = "#00ffcc";
+            imageUpload.disabled = false;
+            videoUpload.disabled = false;
+        }
+        loadModels();
+
+        // 2. Handle Image Calibration (Step 1)
+        imageUpload.addEventListener("change", (event) => {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const url = URL.createObjectURL(file);
+            staticImage.src = url;
+            
+            staticImage.onload = () => {
+                imageCanvas.width = staticImage.naturalWidth;
+                imageCanvas.height = staticImage.naturalHeight;
+                imageCtx.drawImage(staticImage, 0, 0);
+
+                // Run static detection
+                const results = imageLandmarker.detect(staticImage);
+                
+                if (results.landmarks && results.landmarks.length > 0) {
+                    const pose = results.landmarks[0];
+                    let imageCsvData = ["Joint_ID,X,Y,Z,Visibility"];
+                    
+                    // Format mathematical outputs with undefined fallbacks
+                    for (let i = 0; i < pose.length; i++) {
+                        const lm = pose[i];
+                        const x = (lm.x || 0).toFixed(6);
+                        const y = (lm.y || 0).toFixed(6);
+                        const z = (lm.z || 0).toFixed(6);
+                        const v = (lm.visibility || 0).toFixed(4);
+                        imageCsvData.push(`${i},${x},${y},${z},${v}`);
+                    }
+
+                    // Draw the static skeleton
+                    imageDrawingUtils.drawConnectors(pose, PoseLandmarker.POSE_CONNECTIONS, { color: "#FFFFFF", lineWidth: 6 });
+                    imageDrawingUtils.drawLandmarks(pose, { color: "#FF0000", lineWidth: 3, radius: 6 });
+
+                    // Generate CSV Download
+                    const blob = new Blob([imageCsvData.join("\n")], { type: 'text/csv' });
+                    downloadImageCsvBtn.href = URL.createObjectURL(blob);
+                    downloadImageCsvBtn.style.display = "inline-block";
+                    imageCanvas.style.borderColor = "#00ffcc";
+                } else {
+                    alert("No human detected in the calibration image. Please try a clearer, full-body photo.");
+                }
+            };
+        });
+
+        // 3. Handle Video Kinematics (Step 2)
+        videoUpload.addEventListener("change", (event) => {
+            const file = event.target.files[0];
+            if (!file) return;
+            
+            downloadVideoBtn.style.display = "none";
+            downloadVideoCsvBtn.style.display = "none";
+            recordedChunks = [];
+            videoCsvData = ["Frame,Joint_ID,X,Y,Z,Visibility"];
+            frameCount = 0;
+            
+            video.src = URL.createObjectURL(file);
+            status.innerText = `Processing Video... Please let it play to the end.`;
+            status.style.color = "white";
+        });
+
+        video.addEventListener("loadeddata", () => {
+            videoCanvas.width = video.videoWidth;
+            videoCanvas.height = video.videoHeight;
+            video.play();
+            isProcessingVideo = true;
+            videoCanvas.style.borderColor = "#555";
+
+            const stream = videoCanvas.captureStream(30);
+            mediaRecorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
+            
+            mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
+            
+            mediaRecorder.onstop = () => {
+                const videoBlob = new Blob(recordedChunks, { type: 'video/webm' });
+                downloadVideoBtn.href = URL.createObjectURL(videoBlob);
+                downloadVideoBtn.style.display = "inline-block";
+
+                const csvBlob = new Blob([videoCsvData.join("\n")], { type: 'text/csv' });
+                downloadVideoCsvBtn.href = URL.createObjectURL(csvBlob);
+                downloadVideoCsvBtn.style.display = "inline-block";
+
+                status.innerText = "Kinematic Processing Complete!";
+                status.style.color = "#00ffcc";
+                videoCanvas.style.borderColor = "#00ffcc";
+            };
+
+            mediaRecorder.start();
+            predictVideoFrame();
+        });
+
+        async function predictVideoFrame() {
+            if (!isProcessingVideo) return;
+
+            if (video.currentTime !== lastVideoTime) {
+                lastVideoTime = video.currentTime;
+                
+                const results = await videoLandmarker.detectForVideo(video, performance.now());
+                videoCtx.drawImage(video, 0, 0, videoCanvas.width, videoCanvas.height);
+                
+                if (results.landmarks && results.landmarks.length > 0) {
+                    const pose = results.landmarks[0];
+                    for (let i = 0; i < pose.length; i++) {
+                        const lm = pose[i];
+                        const x = (lm.x || 0).toFixed(6);
+                        const y = (lm.y || 0).toFixed(6);
+                        const z = (lm.z || 0).toFixed(6);
+                        const v = (lm.visibility || 0).toFixed(4);
+                        videoCsvData.push(`${frameCount},${i},${x},${y},${z},${v}`);
+                    }
+                    frameCount++;
+                    videoDrawingUtils.drawConnectors(pose, PoseLandmarker.POSE_CONNECTIONS, { color: "#FFFFFF", lineWidth: 4 });
+                    videoDrawingUtils.drawLandmarks(pose, { color: "#FF0000", lineWidth: 2, radius: 4 });
+                }
+            }
+
+            if (!video.ended) {
+                requestAnimationFrame(predictVideoFrame);
+            } else {
+                mediaRecorder.stop();
+                isProcessingVideo = false;
+            }
+        }
+    </script>
+</body>
+</html>
