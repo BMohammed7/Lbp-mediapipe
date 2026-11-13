@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SpinePose Video Analyzer</title>
+    
+    <!-- ONNX Runtime Web -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #1e1e1e;
+            color: #ffffff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin-top: 20px;
+        }
+        .controls {
+            margin-bottom: 15px;
+            padding: 10px;
+            background-color: #333;
+            border-radius: 8px;
+        }
+        input[type="file"] {
+            color: #fff;
+        }
+        canvas {
+            border: 2px solid #555;
+            background-color: #000;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.5);
+            max-width: 90vw; /* Keeps it from blowing up on small screens */
+            max-height: 80vh;
+        }
+        /* Hide the raw video, show only the canvas with the drawn spine */
+        video {
+            display: none; 
+        }
+    </style>
+</head>
+<body>
+
+    <h2>Lifting Video Spine Analyzer</h2>
+    
+    <div class="controls">
+        <label for="videoUpload">Upload Lifting Video: </label>
+        <input type="file" id="videoUpload" accept="video/mp4,video/x-m4v,video/*">
+        <span id="statusText" style="margin-left:10px; color:#ffcc00;">Loading AI Model...</span>
+    </div>
+
+    <!-- Hidden video element to play the uploaded file -->
+    <video class="input_video" playsinline></video>
+    <!-- Visible canvas to draw the video + spine overlay -->
+    <canvas class="output_canvas"></canvas>
+
+    <script>
+        const videoElement = document.querySelector('.input_video');
+        const canvasElement = document.querySelector('.output_canvas');
+        const ctx = canvasElement.getContext('2d');
+        const statusText = document.getElementById('statusText');
+        const videoUpload = document.getElementById('videoUpload');
+        
+        let spineSession = null;
+        let isProcessing = false;
+
+        // 1. Initialize the SpinePose Model
+        async function initSpineModel() {
+            try {
+                // Tell WASM to use 4 CPU cores instead of 1 (massive speed boost if it falls back to CPU)
+                ort.env.wasm.numThreads = 4;
+                // Tell it to use WebAssembly SIMD (advanced math instructions)
+                ort.env.wasm.simd = true;
+
+                // Try WebGPU first (blistering fast, supports modern operators), fallback to multi-threaded WASM
+                spineSession = await ort.InferenceSession.create('./spinepose.onnx', { 
+                    executionProviders: ['webgpu', 'wasm'] 
+                });
+                
+                statusText.textContent = "AI Model Ready. Upload a video!";
+                statusText.style.color = "#00ff00";
+            } catch (error) {
+                console.error("Failed to load model.", error);
+                statusText.textContent = "Error loading AI Model. Check Console (F12).";
+                statusText.style.color = "#ff0000";
+            }
+        }
+
+        // 2. Handle Video Upload
+        videoUpload.addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            // Create a local URL for the uploaded video file
+            const fileURL = URL.createObjectURL(file);
+            videoElement.src = fileURL;
+
+            // Once the video loads its metadata, resize the canvas to match
+            videoElement.onloadedmetadata = () => {
+                canvasElement.width = videoElement.videoWidth;
+                canvasElement.height = videoElement.videoHeight;
+                videoElement.play();
+                
+                // Start processing if not already running
+                if (!isProcessing) {
+                    isProcessing = true;
+                    requestAnimationFrame(processFrame);
+                }
+            };
+        });
+
+        // 3. The processing loop (runs every frame of the video)
+        async function processFrame() {
+            // Stop if video is paused or ended
+            if (videoElement.paused || videoElement.ended) {
+                isProcessing = false;
+                return;
+            }
+
+            // Draw the current video frame to the canvas
+            ctx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+
+            if (spineSession) {
+                // The AI model needs the image resized to 192x256
+                const modelWidth = 192;
+                const modelHeight = 256;
+                
+                const offCanvas = document.createElement('canvas');
+                offCanvas.width = modelWidth; 
+                offCanvas.height = modelHeight;
+                const offCtx = offCanvas.getContext('2d');
+                offCtx.drawImage(videoElement, 0, 0, modelWidth, modelHeight);
+                const imgData = offCtx.getImageData(0, 0, modelWidth, modelHeight).data;
+
+                // Convert image pixels to a Float32 math tensor (NCHW format)
+                const float32Data = new Float32Array(3 * modelWidth * modelHeight);
+                for (let i = 0; i < modelWidth * modelHeight; i++) {
+                    float32Data[i] = imgData[i * 4] / 255.0;                                     // R
+                    float32Data[modelWidth * modelHeight + i] = imgData[i * 4 + 1] / 255.0;      // G
+                    float32Data[2 * modelWidth * modelHeight + i] = imgData[i * 4 + 2] / 255.0;  // B
+                }
+                
+                const inputTensor = new ort.Tensor('float32', float32Data, [1, 3, modelHeight, modelWidth]);
+
+                try {
+                    // Feed the tensor to the AI
+                    const inputName = spineSession.inputNames[0];
+                    const results = await spineSession.run({ [inputName]: inputTensor }); 
+                    
+                    // Grab the separated SimCC X and Y outputs
+                    const simccX = results['simcc_x'].data;
+                    const simccY = results['simcc_y'].data;
+
+                    // Helper function to decode SimCC data into a 0.0 - 1.0 normalized coordinate
+                    const getCoord = (data, kptIndex, totalKeypoints) => {
+                        const bins = data.length / totalKeypoints;
+                        if (bins === 1) return data[kptIndex]; // Already decoded by the model
+                        
+                        // Otherwise, find the probability peak (argmax)
+                        let maxVal = -Infinity;
+                        let maxIdx = 0;
+                        let start = kptIndex * bins;
+                        for (let j = 0; j < bins; j++) {
+                            if (data[start + j] > maxVal) {
+                                maxVal = data[start + j];
+                                maxIdx = j;
+                            }
+                        }
+                        return maxIdx / bins; // Normalize back to 0.0 - 1.0
+                    };
+
+                    // SpineTrack predicts 37 total keypoints
+                    const totalPoints = 37;
+
+                    // 4. Draw the 9 spine keypoints
+                    ctx.beginPath();
+                    ctx.lineWidth = Math.max(4, canvasElement.width / 150);
+                    ctx.strokeStyle = '#00FF00'; // Neon Green Line
+
+                    // Loop through the first 9 points (the spine chain)
+                    for (let i = 0; i < 9; i++) {
+                        const normX = getCoord(simccX, i, totalPoints);
+                        const normY = getCoord(simccY, i, totalPoints);
+
+                        const x = normX * canvasElement.width; 
+                        const y = normY * canvasElement.height;
+
+                        if (i === 0) {
+                            ctx.moveTo(x, y);
+                        } else {
+                            ctx.lineTo(x, y);
+                        }
+
+                        // Draw vertebrae nodes
+                        ctx.fillStyle = '#FF0000';
+                        ctx.beginPath();
+                        ctx.arc(x, y, Math.max(3, canvasElement.width / 200), 0, 2 * Math.PI);
+                        ctx.fill();
+                    }
+                    ctx.stroke();
+
+                } catch (err) {
+                    if (!window.loggedError) {
+                        console.error("Inference failed:", err);
+                        window.loggedError = true;
+                    }
+                }
+            
+            // Loop for the next frame
+            requestAnimationFrame(processFrame);
+        }
+
+        // Boot it up
+        initSpineModel();
+    </script>
+</body>
+</html>

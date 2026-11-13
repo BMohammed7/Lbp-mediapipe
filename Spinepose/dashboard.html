@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SpinePose Web Demo Replication</title>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; margin: 0; display: flex; height: 100vh; color: #333; }
+        .sidebar { width: 350px; padding: 30px; background-color: #fff; border-right: 1px solid #eaeaea; overflow-y: auto; }
+        h3 { color: #2c1a7d; font-size: 1.1rem; margin-bottom: 20px; border-bottom: 1px solid #eaeaea; padding-bottom: 5px; }
+        .control-group { margin-bottom: 25px; }
+        label { display: block; font-size: 0.85rem; font-weight: bold; margin-bottom: 8px; }
+        select, input[type="file"] { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 0.9rem; box-sizing: border-box; }
+        .btn { background-color: #2c1a7d; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-weight: bold; width: 100%; }
+        .btn:disabled { background-color: #ccc; cursor: not-allowed; }
+        .btn-outline { background-color: transparent; color: #2c1a7d; border: 2px solid #2c1a7d; }
+        .help-text { font-size: 0.8rem; color: #666; margin-top: 8px; }
+        
+        .main-content { flex: 1; padding: 30px; background-color: #fafafa; display: flex; flex-direction: column; overflow-y: auto; }
+        .status-bar { background-color: #f3f0ff; padding: 15px; border-left: 4px solid #2c1a7d; margin-bottom: 20px; font-size: 0.9rem; }
+        
+        .video-container { 
+            flex: 1; background-color: #d8d8d8; border-radius: 8px; display: flex; 
+            align-items: center; justify-content: center; position: relative; overflow: hidden; min-height: 500px;
+        }
+        /* Hidden video for processing, visible canvas for drawing */
+        #inputVideo { display: none; }
+        #outputCanvas { max-width: 100%; max-height: 100%; object-fit: contain; }
+        
+        .disclaimer { margin-top: 20px; font-size: 0.85rem; color: #555; background: #fff; padding: 15px; border-left: 4px solid #ccc; }
+    </style>
+</head>
+<body>
+
+    <!-- LEFT SIDEBAR CONTROLS -->
+    <div class="sidebar">
+        <h3>01 Choose a model</h3>
+        <div class="control-group">
+            <label>Processing backend</label>
+            <select id="backendSelect">
+                <option value="webgpu">WebGPU preferred</option>
+                <option value="wasm">WASM (CPU Threads)</option>
+            </select>
+        </div>
+        <button id="loadModelBtn" class="btn">Load model</button>
+        <p class="help-text">The first load downloads model files. Processing then runs in this browser tab.</p>
+        <br>
+        
+        <h3>02 Choose an input</h3>
+        <div class="control-group">
+            <label>Choose a video</label>
+            <input type="file" id="videoUpload" accept="video/mp4,video/x-m4v,video/*">
+        </div>
+        <br>
+
+        <h3>03 Run inference</h3>
+        <div class="control-group" style="display: flex; gap: 10px;">
+            <button id="runVideoBtn" class="btn btn-outline" style="flex: 1;" disabled>Run video</button>
+            <button id="stopTrackingBtn" class="btn btn-outline" style="flex: 1; color: #333; border-color: #ccc;">Stop</button>
+        </div>
+    </div>
+
+    <!-- RIGHT MAIN PREVIEW -->
+    <div class="main-content">
+        <h3 style="border: none; margin-top: 0;">Preview</h3>
+        
+        <div class="status-bar" id="statusBar">
+            Status: Waiting for model load...
+        </div>
+
+        <div class="video-container">
+            <video id="inputVideo" playsinline></video>
+            <canvas id="outputCanvas"></canvas>
+        </div>
+
+        <div class="disclaimer">
+            The colored lines show estimated joints. Results are not intended for clinical decisions.<br><br>
+            <strong>For best results:</strong> Keep one person near the center and fairly large in the frame.
+        </div>
+    </div>
+
+    <script>
+        // DOM Elements
+        const loadModelBtn = document.getElementById('loadModelBtn');
+        const backendSelect = document.getElementById('backendSelect');
+        const videoUpload = document.getElementById('videoUpload');
+        const runVideoBtn = document.getElementById('runVideoBtn');
+        const stopTrackingBtn = document.getElementById('stopTrackingBtn');
+        const statusBar = document.getElementById('statusBar');
+        const videoEl = document.getElementById('inputVideo');
+        const canvasEl = document.getElementById('outputCanvas');
+        const ctx = canvasEl.getContext('2d');
+
+        let spineSession = null;
+        let isProcessing = false;
+        let animationId = null;
+
+        // 1. Load the ONNX Model
+        loadModelBtn.addEventListener('click', async () => {
+            statusBar.textContent = "Status: Loading AI model into memory. Please wait...";
+            loadModelBtn.disabled = true;
+            
+            const backend = backendSelect.value;
+            ort.env.wasm.numThreads = 4;
+            ort.env.wasm.simd = true;
+
+            try {
+                spineSession = await ort.InferenceSession.create('./spinepose.onnx', { 
+                    executionProviders: [backend] 
+                });
+                statusBar.textContent = `Status: Model loaded successfully using ${backend.toUpperCase()}! Ready for video.`;
+                statusBar.style.borderLeftColor = "#00FF00";
+                
+                if (videoEl.src) runVideoBtn.disabled = false;
+            } catch (err) {
+                console.error(err);
+                statusBar.textContent = "Error: Failed to load model. Check F12 console.";
+                statusBar.style.borderLeftColor = "#FF0000";
+                loadModelBtn.disabled = false;
+            }
+        });
+
+        // 2. Handle Video File Upload (With instant render nudge fix)
+        videoUpload.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            videoEl.src = URL.createObjectURL(file);
+            
+            // Wait for video data to load, then seek slightly to force the frame to render
+            videoEl.onloadeddata = () => {
+                canvasEl.width = videoEl.videoWidth;
+                canvasEl.height = videoEl.videoHeight;
+                videoEl.currentTime = 0.001; // Nudge the video to paint the first frame
+            };
+
+            videoEl.onseeked = () => {
+                ctx.drawImage(videoEl, 0, 0, canvasEl.width, canvasEl.height);
+                if (spineSession) runVideoBtn.disabled = false;
+            };
+        });
+
+        // 3. Playback Controls
+        runVideoBtn.addEventListener('click', () => {
+            if (!spineSession || !videoEl.src) return;
+            isProcessing = true;
+            videoEl.play();
+            processFrame();
+        });
+
+        stopTrackingBtn.addEventListener('click', () => {
+            isProcessing = false;
+            videoEl.pause();
+            if (animationId) cancelAnimationFrame(animationId);
+        });
+
+        // 4. Main Inference Loop (Synchronized rendering fix)
+        async function processFrame() {
+            if (!isProcessing || videoEl.paused || videoEl.ended) return;
+
+            const startTime = performance.now();
+
+            // Prepare 192x256 tensor input
+            const modelW = 192, modelH = 256;
+            const offCanvas = document.createElement('canvas');
+            offCanvas.width = modelW; offCanvas.height = modelH;
+            const offCtx = offCanvas.getContext('2d');
+            offCtx.drawImage(videoEl, 0, 0, modelW, modelH);
+            const imgData = offCtx.getImageData(0, 0, modelW, modelH).data;
+
+            const float32Data = new Float32Array(3 * modelW * modelH);
+            for (let i = 0; i < modelW * modelH; i++) {
+                float32Data[i] = imgData[i*4] / 255.0;
+                float32Data[modelW * modelH + i] = imgData[i*4+1] / 255.0;
+                float32Data[2 * modelW * modelH + i] = imgData[i*4+2] / 255.0;
+            }
+            const tensor = new ort.Tensor('float32', float32Data, [1, 3, modelH, modelW]);
+
+            try {
+                // Run inference (This pauses for ~50ms)
+                const inputName = spineSession.inputNames[0];
+                const results = await spineSession.run({ [inputName]: tensor });
+                
+                // INFERENCE DONE: Draw the video frame AND lines together exactly now!
+                ctx.drawImage(videoEl, 0, 0, canvasEl.width, canvasEl.height);
+
+                const simccX = results['simcc_x'].data;
+                const simccY = results['simcc_y'].data;
+                const totalPoints = 37;
+
+                // SimCC Decode Helper
+                const getCoord = (data, kptIdx) => {
+                    const bins = data.length / totalPoints;
+                    let maxVal = -Infinity, maxIdx = 0;
+                    for (let j = 0; j < bins; j++) {
+                        let val = data[kptIdx * bins + j];
+                        if (val > maxVal) { maxVal = val; maxIdx = j; }
+                    }
+                    return maxIdx / bins;
+                };
+
+                // --- FULL SKELETON DRAWING LOGIC ---
+                // Standard body connections (Face, arms, legs, torso box)
+                const bodyEdges = [
+                    [0,1], [0,2], [1,3], [2,4],
+                    [5,7], [7,9], [6,8], [8,10],
+                    [11,13], [13,15], [12,14], [14,16],
+                    [5,6], [11,12], [5,11], [6,12]
+                ];
+                
+                // Spine connections (C7 to pelvis)
+                const spineEdges = [
+                    [17,18], [18,19], [19,20], [20,21], 
+                    [21,22], [22,23], [23,24], [24,25]
+                ];
+
+                // 1. Draw thin body lines (Blue)
+                ctx.lineWidth = Math.max(2, canvasEl.width / 250);
+                ctx.strokeStyle = '#4a90e2';
+                ctx.beginPath();
+                for (const [start, end] of bodyEdges) {
+                    ctx.moveTo(getCoord(simccX, start) * canvasEl.width, getCoord(simccY, start) * canvasEl.height);
+                    ctx.lineTo(getCoord(simccX, end) * canvasEl.width, getCoord(simccY, end) * canvasEl.height);
+                }
+                ctx.stroke();
+
+                // 2. Draw thick spine lines (Orange)
+                ctx.lineWidth = Math.max(4, canvasEl.width / 150);
+                ctx.strokeStyle = '#ff9500'; 
+                ctx.beginPath();
+                for (const [start, end] of spineEdges) {
+                    ctx.moveTo(getCoord(simccX, start) * canvasEl.width, getCoord(simccY, start) * canvasEl.height);
+                    ctx.lineTo(getCoord(simccX, end) * canvasEl.width, getCoord(simccY, end) * canvasEl.height);
+                }
+                ctx.stroke();
+
+                // 3. Draw all joint nodes (White dots with dark borders)
+                ctx.fillStyle = '#ffffff';
+                ctx.strokeStyle = '#333333';
+                ctx.lineWidth = 1.5;
+                for (let i = 0; i <= 25; i++) {
+                    const x = getCoord(simccX, i) * canvasEl.width;
+                    const y = getCoord(simccY, i) * canvasEl.height;
+                    
+                    ctx.beginPath();
+                    ctx.arc(x, y, Math.max(3, canvasEl.width / 250), 0, 2 * Math.PI);
+                    ctx.fill();
+                    ctx.stroke();
+                }
+
+                // Update UI Performance Metric
+                const endTime = performance.now();
+                statusBar.textContent = `Video: 1 pose(s), ${Math.round(endTime - startTime)} ms/frame.`;
+
+            } catch (e) {
+                console.error(e);
+            }
+
+            // Loop next frame
+            animationId = requestAnimationFrame(processFrame);
+        }
+    </script>
+</body>
+</html>

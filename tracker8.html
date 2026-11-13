@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Capstone - Dual Pose Estimation (MediaPipe + SpinePose)</title>
+    
+    <!-- MediaPipe Dependencies -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+
+    <!-- ONNX Runtime Web for SpinePose -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #1e1e1e;
+            color: #ffffff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin-top: 20px;
+        }
+        canvas {
+            border: 2px solid #333;
+            background-color: #000;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.5);
+        }
+        .video-container {
+            position: relative;
+        }
+        /* Hide the raw video element, we only want to see the drawn canvas */
+        .input_video {
+            display: none; 
+        }
+    </style>
+</head>
+<body>
+
+    <h2>Lifting Biomechanics Tracker</h2>
+    
+    <div class="video-container">
+        <video class="input_video" width="1280" height="720" autoplay playsinline></video>
+        <canvas class="output_canvas" width="1280" height="720"></canvas>
+    </div>
+
+    <script>
+        const videoElement = document.getElementsByClassName('input_video')[0];
+        const canvasElement = document.getElementsByClassName('output_canvas')[0];
+        const canvasCtx = canvasElement.getContext('2d');
+
+        let spineSession = null;
+
+        // 1. Initialize ONNX SpinePose Model
+        async function loadSpineModel() {
+            try {
+                // Ensure 'spinepose.onnx' is in the same folder as this HTML file
+                spineSession = await ort.InferenceSession.create('./spinepose.onnx', { 
+                    executionProviders: ['webgl'] 
+                });
+                console.log("SpinePose ONNX model loaded successfully via WebGL.");
+            } catch (error) {
+                console.error("Failed to load SpinePose model. Check file path and ONNX compatibility:", error);
+            }
+        }
+        loadSpineModel();
+
+        // 2. SpinePose Inference Function
+        async function predictSpine(videoEl) {
+            if (!spineSession) return;
+
+            // SpinePose typical input resolution (adjust if using a different variant)
+            const modelWidth = 192;
+            const modelHeight = 256;
+            
+            // Offscreen canvas to resize frame for ONNX tensor
+            const offscreenCanvas = document.createElement('canvas');
+            offscreenCanvas.width = modelWidth;
+            offscreenCanvas.height = modelHeight;
+            const ctx = offscreenCanvas.getContext('2d');
+            
+            ctx.drawImage(videoEl, 0, 0, modelWidth, modelHeight);
+            const imageData = ctx.getImageData(0, 0, modelWidth, modelHeight).data;
+
+            // Convert RGBA to NCHW Float32 format
+            const float32Data = new Float32Array(3 * modelWidth * modelHeight);
+            for (let i = 0; i < modelWidth * modelHeight; i++) {
+                float32Data[i] = imageData[i * 4] / 255.0;                         // R
+                float32Data[modelWidth * modelHeight + i] = imageData[i * 4 + 1] / 255.0;     // G
+                float32Data[2 * modelWidth * modelHeight + i] = imageData[i * 4 + 2] / 255.0; // B
+            }
+            
+            const inputTensor = new ort.Tensor('float32', float32Data, [1, 3, modelHeight, modelWidth]);
+
+            try {
+                // Check your specific ONNX model for the exact input name (often 'input' or 'images')
+                const feeds = { 'input': inputTensor }; 
+                const results = await spineSession.run(feeds);
+                
+                const outputName = spineSession.outputNames[0];
+                const keypoints = results[outputName].data; 
+
+                drawSpine(keypoints, canvasElement.width, canvasElement.height);
+            } catch (err) {
+                console.error("ONNX Inference Error:", err);
+            }
+        }
+
+        // 3. Draw Spine Overlay
+        function drawSpine(keypoints, videoWidth, videoHeight) {
+            // SpineTrack specific indices for the 9 vertebrae points out of the 37 total
+            const spineIndices = [0, 1, 2, 3, 4, 5, 6, 7, 8]; 
+
+            canvasCtx.beginPath();
+            canvasCtx.lineWidth = 6;
+            canvasCtx.strokeStyle = '#00FF00'; // Neon green spine line
+
+            for (let i = 0; i < spineIndices.length; i++) {
+                const index = spineIndices[i];
+                
+                // Assuming standard [x, y, conf] flat array output format
+                // Convert normalized output back to canvas pixel scale
+                const x = keypoints[index * 3] * videoWidth; 
+                const y = keypoints[index * 3 + 1] * videoHeight;
+
+                if (i === 0) {
+                    canvasCtx.moveTo(x, y);
+                } else {
+                    canvasCtx.lineTo(x, y);
+                }
+
+                // Draw individual vertebrae nodes
+                canvasCtx.fillStyle = '#FF0000'; 
+                canvasCtx.beginPath();
+                canvasCtx.arc(x, y, 5, 0, 2 * Math.PI);
+                canvasCtx.fill();
+                
+                // NOTE: To export this to calculation.py, push 'x' and 'y' to your CSV array here
+            }
+            canvasCtx.stroke();
+        }
+
+        // 4. MediaPipe Pose Processing Loop
+        function onResults(results) {
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            
+            // Draw original video frame
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+            // Draw MediaPipe Skeleton (Arms, Legs, Face)
+            if (results.poseLandmarks) {
+                drawConnectors(canvasCtx, results.poseLandmarks, POSE_CONNECTIONS,
+                               {color: '#00CCFF', lineWidth: 4});
+                drawLandmarks(canvasCtx, results.poseLandmarks,
+                              {color: '#FF0000', lineWidth: 2, radius: 3});
+                
+                // Your previous custom lumbopelvic math can stay here if you want to compare them!
+            }
+
+            // Fire the SpinePose inference asynchronously on top of the current frame
+            if (spineSession) {
+                predictSpine(videoElement);
+            }
+
+            canvasCtx.restore();
+        }
+
+        // 5. Initialize MediaPipe
+        const pose = new Pose({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`;
+        }});
+        
+        pose.setOptions({
+            modelComplexity: 1,
+            smoothLandmarks: true,
+            enableSegmentation: false,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        pose.onResults(onResults);
+
+        // 6. Start Webcam
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await pose.send({image: videoElement});
+            },
+            width: 1280,
+            height: 720
+        });
+        camera.start();
+    </script>
+</body>
+</html>
